@@ -1,0 +1,5 @@
+google-api-python-client>=2.0.0
+google-auth-oauthlib>=1.0.0
+python-dateutil>=2.8.0
+sqlite3>=3.0.0  # Typically included with Python
+typing-extensions>=4.0.0  # For better type hints support

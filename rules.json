@@ -1,0 +1,100 @@
+[
+  {
+    "name": "Urgent emails from boss",
+    "predicate": "all",
+    "conditions": [
+      {
+        "field": "from",
+        "predicate": "contains",
+        "value": "boss@company.com"
+      },
+      {
+        "field": "subject",
+        "predicate": "contains",
+        "value": "urgent"
+      },
+      {
+        "field": "received_date",
+        "predicate": "less than",
+        "value": "2 days"
+      }
+    ],
+    "actions": [
+      {
+        "type": "mark as read"
+      },
+      {
+        "type": "move message",
+        "value": "Important"
+      }
+    ]
+  },
+  {
+    "name": "Newsletters older than 1 month",
+    "predicate": "any",
+    "conditions": [
+      {
+        "field": "subject",
+        "predicate": "contains",
+        "value": "newsletter"
+      },
+      {
+        "field": "received_date",
+        "predicate": "greater than",
+        "value": "1 month"
+      }
+    ],
+    "actions": [
+      {
+        "type": "move message",
+        "value": "Newsletters Archive"
+      }
+    ]
+  },
+  {
+    "name": "Personal emails not from family",
+    "predicate": "all",
+    "conditions": [
+      {
+        "field": "message",
+        "predicate": "contains",
+        "value": "nfo"
+      },
+      {
+        "field": "from",
+        "predicate": "does contain",
+        "value": "family.com"
+      }
+    ],
+    "actions": [
+      {
+        "type": "mark as read"
+      }
+    ]
+  },
+  {
+    "name": "Job application follow-ups",
+    "predicate": "all",
+    "conditions": [
+      {
+        "field": "subject",
+        "predicate": "contains",
+        "value": "interview"
+      },
+      {
+        "field": "message",
+        "predicate": "contains",
+        "value": "follow up"
+      }
+    ],
+    "actions": [
+      {
+        "type": "move message",
+        "value": "Job Applications"
+      },
+      {
+        "type": "mark as unread"
+      }
+    ]
+  }
+]
