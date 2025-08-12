@@ -46,8 +46,10 @@ Create a `rules.json` file with your processing rules. Example:
         ]
     }
 ]
+```
+## Rules demystified
 
-
+```
 +----------------+---------------------+---------------------------------+--------------------------------+
 |  Field         |  Predicate          |  Value Format                   |  Example                       |
 +----------------+---------------------+---------------------------------+--------------------------------+
@@ -85,3 +87,10 @@ Create a `rules.json` file with your processing rules. Example:
 |  predicate     |  all                |  All conditions must match      |                                |
 |                |  any                |  Any condition can match        |                                |
 +----------------+---------------------+---------------------------------+--------------------------------+
+```
+
+
+## Scope improvements of current implementation
+- process emails in parallel or async
+- idempotent: track last sync date & pull only unread emails post that
+- a better way to handle errors
