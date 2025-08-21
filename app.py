@@ -124,6 +124,7 @@ class GmailClient:
 		try: return parsedate_to_datetime(date_str).isoformat() if date_str else None
 		except: return ''
 
+
 class EmailRepository:
 	def __init__(self,db_file='emails.db'):
 		self.db_file=db_file
@@ -170,6 +171,7 @@ class EmailRepository:
 			conn.close()
 		except Exception as e: logger.error(f"Error marking email as processed: {e}")
 
+
 class GmailActionExecutor:
 	def __init__(self,gmail_service):
 		self.service=gmail_service
@@ -202,6 +204,7 @@ class GmailActionExecutor:
 			created=self.service.users().labels().create(userId='me',body={'name':label_name,'labelListVisibility':'labelShow','messageListVisibility':'show'}).execute()
 			return created['id']
 		except Exception as e:logger.error(f"Error handling label:{e}");return None
+
 
 class RuleEngine:
 	def __init__(self,rules_file='rules.json'):
@@ -300,6 +303,7 @@ class RuleEngine:
 			return True
 		except Exception as e:logger.error(f"Error executing actions:{e}");return False
 
+
 class EmailProcessor:
 	def __init__(self,token_file,cred_file):
 		self.gmail_client=GmailClient(token_file,cred_file)
@@ -333,6 +337,7 @@ class EmailProcessor:
 						processed_count+=1
 			return processed_count
 		except Exception as e:logger.error(f"Error processing emails:{e}");return 0
+
 
 async def main():
  processor=EmailProcessor('./token.json','./client_secret_292773047087-ecoega11uhdhq0lkot6jua8qi79imdbc.apps.googleusercontent.com.json')
