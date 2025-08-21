@@ -5,69 +5,124 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from email.utils import parsedate_to_datetime
+import asyncio
+import aiohttp
 
 logging.basicConfig(level=logging.INFO)
 logger=logging.getLogger(__name__)
 
 class GmailClient:
-	SCOPES=['https://www.googleapis.com/auth/gmail.modify']
-	
-	def __init__(self,token_file,cred_file):
-		self.token_file=token_file
-		self.credentials_file=cred_file
-		self.service=self._authenticate()
+	SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
+    
+	def __init__(self, token_file, cred_file):
+		self.token_file = token_file
+		self.credentials_file = cred_file
+		self.service = self._authenticate()
+		self.list_url = 'https://gmail.googleapis.com/gmail/v1/users/me/messages'
 	
 	def _authenticate(self):
-		creds=None
+		creds = None
 		if os.path.exists(self.token_file):
-			creds=Credentials.from_authorized_user_file(self.token_file,self.SCOPES)
+			try:
+				creds = Credentials.from_authorized_user_file(self.token_file, self.SCOPES)
+				if creds and creds.expired and creds.refresh_token:
+					creds.refresh(Request())
+			except Exception as e:
+				logger.warning(f"Token refresh failed: {e}")
+				os.unlink(self.token_file)
+				creds = None
 		if not creds or not creds.valid:
-			if creds and creds.expired and creds.refresh_token:
-				creds.refresh(Request())
-			else:
-				flow=InstalledAppFlow.from_client_secrets_file(self.credentials_file,self.SCOPES)
-				creds=flow.run_local_server(port=0)
-			with open(self.token_file,'w')as token:token.write(creds.to_json())
-		return build('gmail','v1',credentials=creds)
+			flow = InstalledAppFlow.from_client_secrets_file(self.credentials_file, self.SCOPES)
+			creds = flow.run_local_server(port=0)
+			with open(self.token_file, 'w') as token:
+				token.write(creds.to_json())
+		return build('gmail', 'v1', credentials=creds)
 	
-	def fetch_emails(self,max_results=10,mock=False):
+	async def fetch_emails(self, max_results=10):
 		try:
-			if mock:
-				return EmailMocker.create_mock_email_list(max_results)
-			results=self.service.users().messages().list(userId='me',labelIds=['INBOX'],maxResults=max_results).execute()
-			emails=[]
-			for msg in results.get('messages',[]):
-				try:
-					email_data=self.service.users().messages().get(userId='me',id=msg['id'],format='raw').execute()
-					email_dict=self._parse_email(email_data)
-					if email_dict:emails.append(email_dict)
-				except Exception as e:logger.error(f"Error processing email {msg['id']}:{e}")
-			return emails
-		except Exception as e:logger.error(f"Error fetching emails:{e}");return[]
-	
-	def _parse_email(self,email_data):
+			creds = self.service._http.credentials
+			if creds.expired: creds.refresh(Request())
+			headers = {"Authorization": f"Bearer {creds.token}"}
+			async with aiohttp.ClientSession(headers=headers) as session:
+				params = {"maxResults": max_results,"labelIds": ["UNREAD", "INBOX"]}
+				synced_till = EmailRepository().max_sync_date()
+				if synced_till: params['q'] = f"after:{synced_till}"
+				async with session.get(self.list_url, params=params) as resp:
+					data = await resp.json()
+					message_ids = [msg['id'] for msg in data.get('messages', [])]
+				semaphore = asyncio.Semaphore(3)
+				
+				async def fetch_with_limit(msg_id):
+					async with semaphore:
+						await asyncio.sleep(0.1)
+						return await self._fetch_single_email(session, msg_id)
+
+				tasks = [fetch_with_limit(msg_id) for msg_id in message_ids]
+				results = await asyncio.gather(*tasks)
+				return [r for r in results if r]
+		except Exception as e: logger.error(f"Error fetching emails: {e}"); return []
+
+	async def _fetch_single_email(self, session, msg_id, retry_count=0):
 		try:
-			msg_str=base64.urlsafe_b64decode(email_data['raw'].encode('ASCII'))
-			mime_msg=email.message_from_bytes(msg_str)
-			email_dict={'gmail_id':email_data['id'],'thread_id':email_data.get('threadId'),'labels':email_data.get('labelIds',[]),'snippet':email_data.get('snippet',''),'internal_date':email_data.get('internalDate'),'is_read':'UNREAD'not in email_data.get('labelIds',[]),'from':'','to':'','subject':'','message':'','received_date':None}
-			for header in ['From','To','Subject','Date']:
-				if header in mime_msg:
-					if header=='Date':
-						try:email_dict['received_date']=parsedate_to_datetime(mime_msg[header]).replace(tzinfo=None).isoformat()
-						except:email_dict['received_date']=None
-					else:email_dict[header.lower()]=mime_msg[header]
-			try:email_dict['message']=self._get_email_body(mime_msg)
-			except:email_dict['message']=''
-			return email_dict
-		except Exception as e:logger.error(f"Error parsing email:{e}");return None
-	
-	def _get_email_body(self,msg):
+			url = f"{self.list_url}/{msg_id}"
+			async with session.get(url, params={"format": "full"}) as resp:
+				if resp.status == 429 and retry_count < 3:
+					wait_time = 2 ** retry_count
+					logger.warning(f"Rate limited for {msg_id}, waiting {wait_time}s (attempt {retry_count + 1})")
+					await asyncio.sleep(wait_time)
+					return await self._fetch_single_email(session, msg_id, retry_count + 1)
+				if resp.status != 200: logger.warning(f"Failed to fetch email {msg_id}: HTTP {resp.status}"); return
+				
+				email_data = await resp.json()
+				if 'error' in email_data:
+					error_code = email_data['error'].get('code', 'unknown')
+					if error_code == 429 and retry_count < 3:
+						wait_time = 2 ** retry_count
+						logger.warning(f"API rate limit for {msg_id}, waiting {wait_time}s")
+						await asyncio.sleep(wait_time)
+						return await self._fetch_single_email(session, msg_id, retry_count + 1)
+					else: logger.error(f"API error for {msg_id}: {email_data['error']}"); return
+				return self._parse_email(email_data)
+		except Exception as e: logger.error(f"Error fetching email {msg_id}: {e}")
+
+	def _parse_email(self, email_data):
 		try:
-			if msg.is_multipart():
-				for part in msg.walk():
-					if part.get_content_type()=='text/plain':return part.get_payload(decode=True).decode('utf-8',errors='ignore')
-			return msg.get_payload(decode=True).decode('utf-8',errors='ignore')
-		except:return''
+			payload = email_data.get('payload', {})
+			headers = {h['name'].lower(): h['value'] for h in payload.get('headers', [])}
+			labels = email_data.get('labelIds', [])
+			internal_date = email_data.get('internalDate',0)
+
+			return {
+				'gmail_id': email_data['id'],
+				'thread_id': email_data.get('threadId', 'unknown_thread'),
+				'labels': labels,
+				'snippet': email_data.get('snippet', ''),
+				'internal_date': internal_date,
+				'is_read': 'UNREAD' not in labels,
+				'from': headers.get('from', ''),
+				'to': headers.get('to', ''),
+				'subject': headers.get('subject', ''),
+				'message': self._get_email_body(payload) or '',
+				'received_date': self._parse_date(headers.get('date')) or ''
+				}
+		except Exception as e:
+			print(f"Problematic email data: {email_data}") 
+			logger.error(f"Error parsing email: {e}")
+			return None
+
+	def _get_email_body(self, payload):
+		try:
+			if 'parts' in payload:
+				for part in payload.get('parts'):
+					if part['mimeType'] == 'text/plain':
+						data = part['body'].get('data', '')
+						if data: return base64.urlsafe_b64decode(data).decode('utf-8')
+			return ''
+		except: return ''
+
+	def _parse_date(self, date_str):
+		try: return parsedate_to_datetime(date_str).isoformat() if date_str else None
+		except: return ''
 
 class EmailRepository:
 	def __init__(self,db_file='emails.db'):
@@ -76,8 +131,18 @@ class EmailRepository:
 	
 	def _init_db(self):
 		conn=sqlite3.connect(self.db_file)
-		conn.execute('''CREATE TABLE IF NOT EXISTS emails(id INTEGER PRIMARY KEY AUTOINCREMENT,gmail_id TEXT UNIQUE,thread_id TEXT,labels TEXT,snippet TEXT,internal_date TEXT,is_read INTEGER,from_email TEXT,to_email TEXT,subject TEXT,message TEXT,received_date TEXT)''')
+		conn.execute('''CREATE TABLE IF NOT EXISTS emails(id INTEGER PRIMARY KEY AUTOINCREMENT,gmail_id TEXT UNIQUE,thread_id TEXT,labels TEXT,snippet TEXT,internal_date TEXT,is_read INTEGER,from_email TEXT,to_email TEXT,subject TEXT,message TEXT,received_date TEXT, condition TEXT)''')
 		conn.commit();conn.close()
+
+	def max_sync_date(self):
+		try:
+			conn = sqlite3.connect(self.db_file)
+			cursor = conn.cursor()
+			cursor.execute("SELECT strftime('%Y/%m/%d', substr(received_date, 1, 19) ) as gmail_date_format FROM emails WHERE received_date IS NOT NULL AND received_date != '' ORDER BY received_date DESC LIMIT 1")
+			result = cursor.fetchone()
+			conn.close()
+			if result: return result[0]
+		except Exception as e: logger.error(f"Error getting max sync date: {e}");
 	
 	def save_email(self,email_data):
 		try:
@@ -90,11 +155,20 @@ class EmailRepository:
 		try:
 			conn=sqlite3.connect(self.db_file)
 			cursor=conn.cursor()
-			cursor.execute('SELECT*FROM emails ORDER BY received_date DESC LIMIT?',(limit,))
+			cursor.execute('SELECT*FROM emails WHERE condition is NULL ORDER BY received_date DESC LIMIT?',(limit,))
 			emails=[dict(zip([column[0]for column in cursor.description],row))for row in cursor.fetchall()]
 			for email_dict in emails:email_dict['labels']=json.loads(email_dict['labels'])
 			conn.close();return emails
 		except Exception as e:logger.error(f"Error fetching emails:{e}");return[]
+	
+	def mark_as_processed(self,email_data,condition):
+		try:
+			conn = sqlite3.connect(self.db_file)
+			cursor = conn.cursor()
+			cursor.execute('UPDATE emails SET condition = ? WHERE gmail_id = ? AND thread_id = ?',(condition, email_data['gmail_id'], email_data['thread_id']))
+			conn.commit()
+			conn.close()
+		except Exception as e: logger.error(f"Error marking email as processed: {e}")
 
 class GmailActionExecutor:
 	def __init__(self,gmail_service):
@@ -128,29 +202,6 @@ class GmailActionExecutor:
 			created=self.service.users().labels().create(userId='me',body={'name':label_name,'labelListVisibility':'labelShow','messageListVisibility':'show'}).execute()
 			return created['id']
 		except Exception as e:logger.error(f"Error handling label:{e}");return None
-
-class EmailMocker:
-	@staticmethod
-	def create_mock_email(**kwargs):
-		default_email={
-			'gmail_id':'mock_'+str(hash(str(datetime.now()))),
-			'thread_id':'thread_'+str(hash(str(datetime.now()))),
-			'labels':['INBOX'],
-			'snippet':'This is a mock email snippet',
-			'internal_date':str(int(datetime.now().timestamp()*1000)),
-			'is_read':False,
-			'from':'mock.sender@example.com',
-			'to':'mock.recipient@example.com',
-			'subject':'Mock Email Subject',
-			'message':'This is the body of the mock email',
-			'received_date':datetime.now().isoformat()
-		}
-		default_email.update(kwargs)
-		return default_email
-
-	@staticmethod
-	def create_mock_email_list(count=5):
-		return [EmailMocker.create_mock_email()for _ in range(count)]
 
 class RuleEngine:
 	def __init__(self,rules_file='rules.json'):
@@ -200,9 +251,9 @@ class RuleEngine:
 			for rule in self.rules:
 				if self._evaluate_rule(rule,email_data):
 					self._execute_actions(rule['actions'],email_data['gmail_id'],action_executor)
-					print(email_data['subject'])
-					print(rule)
-					return True
+					cond = rule['conditions'][0]
+					print(f"● '{email_data['subject']}' → {cond['field']} {cond['predicate']} '{cond['value']}' → {rule['actions'][0]['type']}")
+					return str(cond)
 			return False
 		except Exception as e:logger.error(f"Error processing email:{e}");return False
 	
@@ -255,10 +306,10 @@ class EmailProcessor:
 		self.repository=EmailRepository()
 		self.action_executor=GmailActionExecutor(self.gmail_client.service)
 		self.rule_engine=RuleEngine()
-	
-	def fetch_and_store_emails(self,max_results=10,mock=False):
+
+	async def fetch_and_store_emails(self, max_results=10):
 		try:
-			emails=self.gmail_client.fetch_emails(max_results,mock)
+			emails = await self.gmail_client.fetch_emails(max_results)
 			for email_data in emails:
 				if email_data:self.repository.save_email(email_data)
 			return True
@@ -272,22 +323,27 @@ class EmailProcessor:
 	
 	def process_emails(self):
 		try:
+			er = EmailRepository()
 			processed_count=0
 			for email_data in self.repository.get_emails():
-				if email_data and self.rule_engine.process_email(email_data,self.action_executor):
-					processed_count+=1
+				if email_data:
+					condition = self.rule_engine.process_email(email_data,self.action_executor)
+					if condition is not False:
+						er.mark_as_processed(email_data, condition)
+						processed_count+=1
 			return processed_count
 		except Exception as e:logger.error(f"Error processing emails:{e}");return 0
 
-def main():
-	processor=EmailProcessor('./token.json','./credentials.json')
-	print("Fetching emails...")
-	if processor.fetch_and_store_emails(max_results=50,mock=False):print("Emails fetched successfully.")
-	else:print("Failed to fetch emails.")
-	print("Loading rules...")
-	if processor.load_rules('./rules.json'):print("Rules loaded successfully.")
-	else:print("Failed to load rules.")
-	print("Processing emails...")
-	print(f"Processed {processor.process_emails()} emails.")
+async def main():
+ processor=EmailProcessor('./token.json','./client_secret_292773047087-ecoega11uhdhq0lkot6jua8qi79imdbc.apps.googleusercontent.com.json')
+ print("Fetching emails...")
+ if await processor.fetch_and_store_emails(max_results=50):print("Emails fetched successfully.")
+ else:print("Failed to fetch emails.")
+ print("Loading rules...")
+ if processor.load_rules('./rules.json'):print("Rules loaded successfully.")
+ else:print("Failed to load rules.")
+ print("Processing emails...")
+ print(f"Processed {processor.process_emails()} emails.")
 
-if __name__=='__main__':main()
+if __name__=='__main__':
+ asyncio.run(main())
